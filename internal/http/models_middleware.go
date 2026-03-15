@@ -36,6 +36,13 @@ func CLIProxyModelsMiddleware(db *gorm.DB, store *modelregistry.Store) gin.Handl
 
 		path := normalizeRequestPath(c.Request.URL.Path)
 		switch path {
+		case "/v1/models", "/v1beta/models":
+			if !authenticateModelsRequest(c, db) {
+				return
+			}
+		}
+
+		switch path {
 		case "/v1/models":
 			onlyMapped := dbConfigBool("ONLY_MAPPED_MODELS")
 			userGroups, billUserGroups, okUser := loadUserGroupMembership(c, db)
@@ -464,6 +471,94 @@ func convertModelToMap(model *sdkcliproxy.ModelInfo, handlerType string) map[str
 		}
 		return result
 	}
+}
+
+// authenticateModelsRequest validates the API key for /v1/models and /v1beta/models
+// requests. Since this middleware runs before route-group auth, it must enforce
+// authentication independently. Returns true if authenticated, false if rejected.
+func authenticateModelsRequest(c *gin.Context, db *gorm.DB) bool {
+	if c == nil || c.Request == nil || db == nil {
+		return false
+	}
+
+	token := extractModelsToken(c.Request)
+	if token == "" {
+		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
+			"error": map[string]any{
+				"message": "API key is required",
+				"type":    "authentication_error",
+			},
+		})
+		return false
+	}
+
+	var apiKey models.APIKey
+	err := db.WithContext(c.Request.Context()).
+		Preload("User").
+		Where("api_key = ? AND active = ? AND revoked_at IS NULL", token, true).
+		First(&apiKey).Error
+	if err != nil {
+		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
+			"error": map[string]any{
+				"message": "Invalid API key",
+				"type":    "authentication_error",
+			},
+		})
+		return false
+	}
+
+	if apiKey.User != nil && apiKey.User.Disabled {
+		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
+			"error": map[string]any{
+				"message": "Account disabled",
+				"type":    "authentication_error",
+			},
+		})
+		return false
+	}
+
+	// Set accessMetadata so downstream loadUserGroupMembership works correctly.
+	meta := map[string]string{
+		"api_key_id":   strconv.FormatUint(apiKey.ID, 10),
+		"api_key_name": apiKey.Name,
+		"is_admin":     strconv.FormatBool(apiKey.IsAdmin),
+	}
+	if apiKey.UserID != nil {
+		meta["user_id"] = strconv.FormatUint(*apiKey.UserID, 10)
+	}
+	c.Set("accessMetadata", meta)
+
+	return true
+}
+
+// extractModelsToken extracts an API key from request headers or query parameters.
+func extractModelsToken(r *http.Request) string {
+	if r == nil {
+		return ""
+	}
+	// Bearer token from Authorization header.
+	if val := strings.TrimSpace(r.Header.Get("Authorization")); val != "" {
+		if strings.HasPrefix(val, "Bearer ") {
+			if t := strings.TrimSpace(strings.TrimPrefix(val, "Bearer ")); t != "" {
+				return t
+			}
+		}
+	}
+	// X-API-Key header.
+	if v := strings.TrimSpace(r.Header.Get("X-API-Key")); v != "" {
+		return v
+	}
+	// X-Goog-Api-Key header (Gemini clients).
+	if v := strings.TrimSpace(r.Header.Get("X-Goog-Api-Key")); v != "" {
+		return v
+	}
+	// Query parameter for /v1beta (Gemini convention).
+	if r.URL != nil && strings.HasPrefix(r.URL.Path, "/v1beta") {
+		if v := strings.TrimSpace(r.URL.Query().Get("key")); v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // listMappedModelInfos returns model infos derived from DB mappings.
