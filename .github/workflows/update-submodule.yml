@@ -1,0 +1,39 @@
+name: Update Web Submodule
+
+on:
+  repository_dispatch:
+    types: [web-submodule-updated]
+
+jobs:
+  update-submodule:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          ssh-key: ${{ secrets.SUBMODULE_SSH_KEY }}
+          token: ${{ secrets.SUBMODULE_SSH_KEY && github.token }}
+
+      - name: Update web submodule to latest main
+        run: |
+          git submodule update --remote web
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Check for changes
+        id: check
+        run: |
+          if git diff --quiet web; then
+            echo "changed=false" >> $GITHUB_OUTPUT
+          else
+            echo "changed=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Commit and push
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          WEB_SHA=$(cd web && git rev-parse --short HEAD)
+          git add web
+          git commit -m "Update web submodule to ${WEB_SHA}"
+          git push origin main
